@@ -1,22 +1,28 @@
 package com.winterbot
 
 import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.GestureDescription
 import android.content.Intent
-import android.graphics.Path
-import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
-import android.os.VibrationEffect
-import android.os.Vibrator
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
-import android.widget.Toast
-import androidx.core.content.ContextCompat
+import com.winterbot.core.ImageMatcher
+import com.winterbot.core.ScreenCapturer
+import com.winterbot.core.TemplateManager
+import com.winterbot.modules.GatherModule
+import com.winterbot.modules.MailModule
+import com.winterbot.modules.ResourceModule
+import com.winterbot.modules.TaskModule
+import com.winterbot.ui.FloatWindowManager
 
 /**
  * 无尽冬日 · 游戏自动化服务
- * 基于 Android AccessibilityService 实现
+ * 基于 AccessibilityService + MediaProjection + OpenCV 图像识别
+ *
+ * 架构：
+ * - 核心层：截图、图像匹配、模板管理
+ * - 模块层：各功能独立模块继承 BaseModule
+ * - 调度层：主循环按优先级轮询执行各模块
  */
 class GameAutomationService : AccessibilityService() {
 
@@ -24,24 +30,44 @@ class GameAutomationService : AccessibilityService() {
     private var isBotRunning = false
     private var currentCycle = 0
     private var featureConfig = mutableMapOf<String, Boolean>()
-    private var screenWidth = 1080
-    private var screenHeight = 1920
 
-    // 配置默认值
+    var screenWidth = 1080
+    var screenHeight = 1920
+    var screenCapturer: ScreenCapturer? = null
+
+    // 功能模块
+    private lateinit var resourceModule: ResourceModule
+    private lateinit var mailModule: MailModule
+    private lateinit var taskModule: TaskModule
+    private lateinit var gatherModule: GatherModule
+
+    // 悬浮窗
+    private var floatWindow: FloatWindowManager? = null
+
+    // 默认配置
     private val defaultConfig = mapOf(
         "gather" to true,
-        "upgrade" to true,
-        "hunt" to true,
-        "alliance" to true,
-        "shield" to true,
-        "tasks" to true,
         "mail" to true,
+        "tasks" to true,
+        "resource" to true,
+        "upgrade" to false,
+        "hunt" to false,
+        "alliance" to false,
+        "shield" to false,
     )
 
     inner class LocalBinder {
         fun isRunning() = isBotRunning
         fun startBot(config: Map<String, Boolean>) = this@GameAutomationService.startBot(config)
         fun stopBot() = this@GameAutomationService.stopBot()
+        fun hasScreenCapture() = screenCapturer != null
+        fun setScreenCapturer(capturer: ScreenCapturer) {
+            this@GameAutomationService.screenCapturer = capturer
+        }
+        fun updateScreenSize(w: Int, h: Int) {
+            screenWidth = w
+            screenHeight = h
+        }
     }
 
     private val binder = LocalBinder()
@@ -50,20 +76,36 @@ class GameAutomationService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        // 获取屏幕尺寸
-        val display = android.hardware.display.DisplayManager::class.java
-            .let { getSystemService(DISPLAY_SERVICE) as? android.hardware.display.DisplayManager }
-            ?.getDisplay(0)
-        val metrics = android.util.DisplayMetrics()
-        display?.getRealMetrics(metrics)
-        screenWidth = metrics.widthPixels
-        screenHeight = metrics.heightPixels
 
-        showToast("无障碍服务已连接")
+        // 获取屏幕尺寸
+        val display = getSystemService(DISPLAY_SERVICE) as? android.hardware.display.DisplayManager
+        display?.getDisplay(0)?.let {
+            val metrics = android.util.DisplayMetrics()
+            it.getRealMetrics(metrics)
+            screenWidth = metrics.widthPixels
+            screenHeight = metrics.heightPixels
+        }
+
+        // 初始化 OpenCV
+        ImageMatcher.init()
+
+        // 加载模板
+        TemplateManager.loadAll(this)
+
+        // 初始化模块
+        resourceModule = ResourceModule(this)
+        mailModule = MailModule(this)
+        taskModule = TaskModule(this)
+        gatherModule = GatherModule(this)
+
+        // 初始化悬浮窗
+        floatWindow = FloatWindowManager(this)
+
+        Log.d("WinterBot", "服务已连接，屏幕: ${screenWidth}x${screenHeight}")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // 不需要处理事件，脚本自动执行
+        // 事件监听（可选，用于弹窗检测等）
     }
 
     override fun onInterrupt() {
@@ -76,230 +118,113 @@ class GameAutomationService : AccessibilityService() {
 
     private fun startBot(config: Map<String, Boolean>) {
         if (isBotRunning) return
+
+        if (screenCapturer == null) {
+            Log.e("WinterBot", "未初始化截屏服务，无法启动")
+            return
+        }
+
         featureConfig = config.toMutableMap()
-        // 填充默认值
         for ((k, v) in defaultConfig) {
             if (!featureConfig.containsKey(k)) featureConfig[k] = v
         }
+
         isBotRunning = true
         currentCycle = 0
-        showToast("🤖 开始挂机")
+
+        floatWindow?.show()
+        floatWindow?.updateStatus("🤖 挂机中")
+
+        Log.d("WinterBot", "开始挂机")
         runCycle()
     }
 
     private fun stopBot() {
         isBotRunning = false
         handler.removeCallbacksAndMessages(null)
-        showToast("⏹ 挂机已停止")
+        floatWindow?.updateStatus("⏸ 已停止")
+        Log.d("WinterBot", "挂机已停止")
     }
 
     // ═══════════════════════════════════════
-    //  主循环
+    //  主循环调度
     // ═══════════════════════════════════════
 
     private fun runCycle() {
         if (!isBotRunning) return
         currentCycle++
-        log("═══ 第 $currentCycle 轮 ═══")
+        updateStatus("═══ 第 $currentCycle 轮 ═══")
+        Log.d("WinterBot", "=== 第 $currentCycle 轮开始 ===")
 
-        val tasks = mutableListOf<() -> Unit>()
+        // 按优先级构建任务列表
+        val tasks = mutableListOf<Pair<String, () -> Boolean>>()
 
-        if (featureConfig["mail"] == true) tasks.add { claimMail() }
-        if (featureConfig["tasks"] == true) tasks.add { doTasks() }
-        if (featureConfig["gather"] == true) tasks.add { collectResources() }
-        if (featureConfig["upgrade"] == true) tasks.add { upgradeBuilding() }
-        if (featureConfig["hunt"] == true) tasks.add { huntMonster() }
-        if (featureConfig["alliance"] == true) tasks.add { allianceHelp() }
-        if (featureConfig["shield"] == true) tasks.add { checkShield() }
+        // 高频任务优先
+        if (featureConfig["mail"] == true) tasks.add("邮件" to { mailModule.execute() })
+        if (featureConfig["tasks"] == true) tasks.add("任务" to { taskModule.execute() })
+        if (featureConfig["resource"] == true) tasks.add("资源" to { resourceModule.execute() })
+        if (featureConfig["gather"] == true) tasks.add("采集" to { gatherModule.execute() })
 
         // 打乱顺序防检测
         tasks.shuffle()
 
-        // 逐个执行
         executeTasksSequentially(tasks, 0)
     }
 
-    private fun executeTasksSequentially(tasks: List<() -> Unit>, index: Int) {
-        if (!isBotRunning || index >= tasks.size) {
-            // 所有任务完成，等待下一轮
-            if (isBotRunning) {
-                handler.postDelayed({
-                    runCycle()
-                }, 20 * 60 * 1000L) // 20分钟
-            }
+    private fun executeTasksSequentially(
+        tasks: List<Pair<String, () -> Boolean>>,
+        index: Int
+    ) {
+        if (!isBotRunning) return
+        if (index >= tasks.size) {
+            // 一轮结束，等待下一轮
+            val nextDelay = 15 * 60 * 1000 + (Math.random() * 5 * 60 * 1000).toLong()
+            updateStatus("💤 本轮完成，${nextDelay / 60000} 分钟后开始下一轮")
+            handler.postDelayed({ runCycle() }, nextDelay)
             return
         }
 
+        val (name, task) = tasks[index]
+        updateStatus("🔄 执行: $name")
+
         try {
-            tasks[index]()
+            val result = task()
+            Log.d("WinterBot", "$name 执行结果: $result")
         } catch (e: Exception) {
-            log("任务异常: ${e.message}")
+            Log.e("WinterBot", "$name 执行异常: ${e.message}", e)
+            updateStatus("⚠️ $name 异常: ${e.message}")
         }
 
-        // 随机延迟后执行下一个任务
-        val delay = 2000 + (Math.random() * 3000).toInt()
+        // 任务间随机延迟
+        val delay = 3000 + (Math.random() * 5000).toLong()
         handler.postDelayed({
             executeTasksSequentially(tasks, index + 1)
-        }, delay.toLong())
+        }, delay)
     }
 
     // ═══════════════════════════════════════
-    //  操作函数
+    //  状态更新
     // ═══════════════════════════════════════
 
-    private fun click(x: Int, y: Int) {
-        val jitter = (Math.random() * 10).toInt() - 5
-        val path = Path().apply {
-            moveTo(x + jitter.toFloat(), y + jitter.toFloat())
-        }
-        val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 100))
-            .build()
-        dispatchGesture(gesture, null, null)
-        sleep(500)
+    fun updateStatus(text: String) {
+        floatWindow?.updateStatus(text)
+        Log.d("WinterBot", "状态: $text")
     }
 
-    private fun sleep(ms: Int) {
-        try { Thread.sleep(ms.toLong()) } catch (_: InterruptedException) {}
+    override fun onDestroy() {
+        super.onDestroy()
+        stopBot()
+        floatWindow?.hide()
+        screenCapturer?.release()
+        TemplateManager.release()
     }
 
-    private fun log(msg: String) {
-        android.util.Log.d("WinterBot", msg)
+    companion object {
+        var instance: GameAutomationService? = null
+            private set
     }
 
-    private fun showToast(msg: String) {
-        handler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
-    }
-
-    private fun vibrate() {
-        try {
-            val vibrator = getSystemService(VIBRATOR_SERVICE) as Vibrator
-            vibrator.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
-        } catch (_: Exception) {}
-    }
-
-    private fun backPress() {
-        performGlobalAction(GLOBAL_ACTION_BACK)
-        sleep(500)
-    }
-
-    private fun goHome(times: Int = 4) {
-        for (i in 0 until times) {
-            performGlobalAction(GLOBAL_ACTION_BACK)
-            sleep(300)
-        }
-        sleep(1500)
-    }
-
-    private fun findText(text: String): AccessibilityNodeInfo? {
-        return try {
-            rootInActiveWindow?.findAccessibilityNodeInfosByText(text)
-                ?.firstOrNull()
-        } catch (_: Exception) { null }
-    }
-
-    private fun clickText(text: String): Boolean {
-        val node = findText(text)
-        if (node != null) {
-            val rect = Rect()
-            node.getBoundsInScreen(rect)
-            click(rect.centerX(), rect.centerY())
-            node.recycle()
-            return true
-        }
-        return false
-    }
-
-    // ═══════════════════════════════════════
-    //  功能实现
-    // ═══════════════════════════════════════
-
-    private fun collectResources() {
-        log("💰 收取资源")
-        // 右下角面板
-        click(screenWidth - 80, screenHeight - 180)
-        sleep(2000)
-        clickText("全部收取")
-        sleep(2000)
-        backPress()
-        sleep(500)
-        goHome()
-        log("✅ 资源已收取")
-    }
-
-    private fun upgradeBuilding() {
-        log("🏗️ 升级建筑")
-        click(screenWidth / 2, screenHeight / 2 - 50)
-        sleep(2000)
-        clickText("升级")
-        sleep(2000)
-        clickText("加速")
-        sleep(1000)
-        goHome()
-        log("✅ 建筑升级")
-    }
-
-    private fun huntMonster() {
-        log("🐾 扫野")
-        clickText("地图")
-        sleep(2000)
-        click(screenWidth / 2, screenHeight / 3)
-        sleep(1500)
-        clickText("出征")
-        sleep(2000)
-        clickText("确定")
-        sleep(1000)
-        goHome()
-        log("✅ 扫野完成")
-    }
-
-    private fun allianceHelp() {
-        log("🤝 联盟")
-        clickText("联盟")
-        sleep(2000)
-        for (i in 0 until 10) {
-            if (!clickText("帮助")) break
-            sleep(800)
-        }
-        clickText("捐献")
-        sleep(1500)
-        clickText("捐献")
-        sleep(1000)
-        goHome()
-        log("✅ 联盟完成")
-    }
-
-    private fun checkShield() {
-        log("🛡️ 护盾")
-        clickText("背包")
-        sleep(2000)
-        clickText("护盾")
-        sleep(1000)
-        clickText("使用")
-        sleep(1500)
-        goHome()
-        log("✅ 护盾检查完成")
-    }
-
-    private fun doTasks() {
-        log("📋 任务")
-        clickText("任务")
-        sleep(2000)
-        for (i in 0 until 10) {
-            if (!clickText("领取")) break
-            sleep(800)
-        }
-        goHome()
-        log("✅ 任务完成")
-    }
-
-    private fun claimMail() {
-        log("📧 邮件")
-        clickText("邮件")
-        sleep(2000)
-        clickText("全部领取")
-        sleep(1500)
-        goHome()
-        log("✅ 邮件已领")
+    init {
+        instance = this
     }
 }
